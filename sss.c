@@ -185,8 +185,6 @@ static struct {
     int chunks;		/* Number of allocated chunks */
 } buffer;
 
-static const char *TCP_PROTO = "tcp";
-
 enum {
     TCP_DB,
     MAX_DB
@@ -957,29 +955,6 @@ static const char *print_ms_timer(unsigned int timeout)
     return buf;
 }
 
-/* Even do not try default linux ephemeral port ranges:
- * default /etc/services contains so much of useless crap
- * wouldbe "allocated" to this area that resolution
- * is really harmful. I shrug each time when seeing
- * "socks" or "cfinger" in dumps.
- */
-static int is_ephemeral(int port)
-{
-    static int min = 0, max;
-
-    if (!min) {
-        FILE *f = ephemeral_ports_open();
-
-        if (!f || fscanf(f, "%d %d", &min, &max) < 2) {
-            min = 1024;
-            max = 4999;
-        }
-        if (f)
-            fclose(f);
-    }
-    return port >= min && port <= max;
-}
-
 static const char *resolve_service(int port)
 {
     static char buf[128];
@@ -1696,10 +1671,7 @@ static int tcpdiag_send(int fd, int protocol, struct filter *f)
             .r.idiag_family = AF_INET,
             .r.idiag_states = f->states,
     };
-    char    *bc = NULL;
-    int	bclen;
     struct msghdr msg;
-    struct rtattr rta;
     struct iovec iov[3];
     int iovlen = 1;
 
@@ -1745,11 +1717,8 @@ static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
 {
     struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
     DIAG_REQUEST(req, struct inet_diag_req_v2 r);
-    char    *bc = NULL;
-    int	bclen;
     __u32	proto;
     struct msghdr msg;
-    struct rtattr rta_bc;
     struct rtattr rta_proto;
     struct iovec iov[5];
     int iovlen = 1;
