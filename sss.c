@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include "ss_util.h"
 #include "libnetlink.h"
@@ -1980,6 +1981,9 @@ static void _usage(FILE *dest)
             "\n"
             "   -H, --no-header     Suppress header line\n"
             "   -O, --oneline       socket's data printed on a single line\n"
+            "\n"
+            "       --time          the time to run this tool for (see also interval)\n"
+            "       --interval      interval between printing current statistics\n"
     );
 }
 
@@ -1997,6 +2001,9 @@ static void usage(void)
     exit(-1);
 }
 
+#define OPT_TIME 256
+#define OPT_INTERVAL 257
+
 static const struct option long_opts[] = {
         { "options", 0, 0, 'o' },
         { "memory", 0, 0, 'm' },
@@ -2007,14 +2014,39 @@ static const struct option long_opts[] = {
         { "help", 0, 0, 'h' },
         { "no-header", 0, 0, 'H' },
         { "oneline", 0, 0, 'O' },
+        { "time", 1, 0, OPT_TIME },
+        { "interval", 1, 0, OPT_INTERVAL },
         { 0 }
 
 };
+
+static long parse_number(const char *str)
+{
+    char *endptr;
+    long val;
+
+    errno = 0;
+    val = strtol(str, &endptr, 10);
+
+    if (errno != 0) {
+        perror("strtol");
+        exit(EXIT_FAILURE);
+    }
+
+    if (str == endptr) {
+        fprintf(stderr, "Unable to convert numeric argument\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return val;
+}
 
 int main(int argc, char *argv[])
 {
     int ch;
     int state_filter = 0;
+    long time = 100;
+    long interval = 100;
 
     while ((ch = getopt_long(argc, argv,
                              "halomivVHO",
@@ -2045,12 +2077,23 @@ int main(int argc, char *argv[])
             case 'O':
                 oneline = 1;
                 break;
+            case OPT_TIME:
+                time = parse_number(optarg);
+                break;
+            case OPT_INTERVAL:
+                interval = parse_number(optarg);
+                break;
             case 'h':
                 help();
             case '?':
             default:
                 usage();
         }
+    }
+
+    if (time == 0 || interval == 0) {
+        fprintf(stderr, "time/interval cannot be zero!\n");
+        exit(EXIT_FAILURE);
     }
 
     // Show only tcp sockets and ipv4 by default
@@ -2083,9 +2126,21 @@ int main(int argc, char *argv[])
         print_header();
 
     fflush(stdout);
-    
-    tcp_show(&current_filter);
 
+    long repetitions = (time + interval - 1) / interval;
+
+    struct timespec tspec;
+    tspec.tv_sec = interval / 1000;
+    tspec.tv_nsec = (interval % 1000) * 1000000;
+
+    for (long i = 0; i < repetitions - 1; ++i) {
+        tcp_show(&current_filter);
+        render();
+        if (show_header)
+            print_header();
+        nanosleep(&tspec, NULL);
+    }
+    tcp_show(&current_filter);
     render();
 
     return 0;
