@@ -235,7 +235,6 @@ static const struct filter default_afs[AF_MAX] = {
         },
 };
 
-static int do_default = 1;
 static struct filter current_filter;
 
 static void filter_db_set(struct filter *f, int db, bool enable)
@@ -246,44 +245,12 @@ static void filter_db_set(struct filter *f, int db, bool enable)
     } else {
         f->dbs &= ~(1 << db);
     }
-    do_default   = 0;
-}
-
-static int filter_db_parse(struct filter *f, const char *s)
-{
-    const struct {
-        const char *name;
-        int dbs[MAX_DB + 1];
-    } db_name_tbl[] = {
-#define ENTRY(name, ...) { #name, { __VA_ARGS__, MAX_DB } }
-            ENTRY(all, TCP_DB),
-            ENTRY(inet, TCP_DB),
-            ENTRY(tcp, TCP_DB),
-#undef ENTRY
-    };
-    bool enable = true;
-    unsigned int i;
-    const int *dbp;
-
-    if (s[0] == '!') {
-        enable = false;
-        s++;
-    }
-    for (i = 0; i < ARRAY_SIZE(db_name_tbl); i++) {
-        if (strcmp(s, db_name_tbl[i].name))
-            continue;
-        for (dbp = db_name_tbl[i].dbs; *dbp != MAX_DB; dbp++)
-            filter_db_set(f, *dbp, enable);
-        return 0;
-    }
-    return -1;
 }
 
 static void filter_af_set(struct filter *f, int af)
 {
     f->states	   |= default_afs[af].states;
     f->families	   |= FAMILY_MASK(af);
-    do_default	    = 0;
     preferred_family    = af;
 }
 
@@ -2011,9 +1978,6 @@ static void _usage(FILE *dest)
             "   -m, --memory        show socket memory usage\n"
             "   -i, --info          show internal TCP information\n"
             "\n"
-            "   -4, --ipv4          display only IP version 4 sockets\n"
-            "   -t, --tcp           display only TCP sockets\n"
-            "\n"
             "   -H, --no-header     Suppress header line\n"
             "   -O, --oneline       socket's data printed on a single line\n"
     );
@@ -2037,10 +2001,8 @@ static const struct option long_opts[] = {
         { "options", 0, 0, 'o' },
         { "memory", 0, 0, 'm' },
         { "info", 0, 0, 'i' },
-        { "tcp", 0, 0, 't' },
         { "all", 0, 0, 'a' },
         { "listening", 0, 0, 'l' },
-        { "ipv4", 0, 0, '4' },
         { "version", 0, 0, 'V' },
         { "help", 0, 0, 'h' },
         { "no-header", 0, 0, 'H' },
@@ -2055,7 +2017,7 @@ int main(int argc, char *argv[])
     int state_filter = 0;
 
     while ((ch = getopt_long(argc, argv,
-                             "halto4mivVHO",
+                             "halomivVHO",
                              long_opts, NULL)) != EOF) {
         switch (ch) {
             case 'o':
@@ -2067,17 +2029,11 @@ int main(int argc, char *argv[])
             case 'i':
                 show_tcpinfo = 1;
                 break;
-            case 't':
-                filter_db_set(&current_filter, TCP_DB, true);
-                break;
             case 'a':
                 state_filter = SS_ALL;
                 break;
             case 'l':
                 state_filter = (1 << SS_LISTEN) | (1 << SS_CLOSE);
-                break;
-            case '4':
-                filter_af_set(&current_filter, AF_INET);
                 break;
             case 'v':
             case 'V':
@@ -2097,10 +2053,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (do_default) {
-        state_filter = state_filter ? state_filter : SS_CONN;
-        filter_db_parse(&current_filter, "all");
-    }
+    // Show only tcp sockets and ipv4 by default
+    filter_db_set(&current_filter, TCP_DB, true);
+    filter_af_set(&current_filter, AF_INET);
 
     filter_states_set(&current_filter, state_filter);
     filter_merge_defaults(&current_filter);
@@ -2128,9 +2083,8 @@ int main(int argc, char *argv[])
         print_header();
 
     fflush(stdout);
-
-    if (current_filter.dbs & (1<<TCP_DB))
-        tcp_show(&current_filter);
+    
+    tcp_show(&current_filter);
 
     render();
 
