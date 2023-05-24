@@ -2081,7 +2081,7 @@ int main(int argc, char *argv[])
                 break;
             case 'v':
             case 'V':
-                printf("ss utility, iproute2-%s\n", version);
+                printf("simple socket statistics %s\n", version);
                 exit(0);
             case 'H':
                 show_header = 0;
