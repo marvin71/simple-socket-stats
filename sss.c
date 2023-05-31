@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -114,10 +113,11 @@ int preferred_family = AF_UNSPEC;
 static int show_options;
 static int show_mem;
 static int show_tcpinfo;
-static int show_header = 1;
-int oneline;
+static int show_header = 0;
+static FILE *out_file;
 
 enum col_id {
+    COL_TIME,
     COL_NETID,
     COL_STATE,
     COL_RECVQ,
@@ -131,32 +131,23 @@ enum col_id {
     COL_MAX
 };
 
-enum col_align {
-    ALIGN_LEFT,
-    ALIGN_CENTER,
-    ALIGN_RIGHT
-};
-
 struct column {
-    const enum col_align align;
     const char *header;
-    const char *ldelim;
     int disabled;
-    int width;	/* Calculated, including additional layout spacing */
-    int max_len;	/* Measured maximum field length in this column */
 };
 
 static struct column columns[] = {
-        { ALIGN_LEFT,	"Netid",		"",	0, 0, 0 },
-        { ALIGN_LEFT,	"State",		" ",	0, 0, 0 },
-        { ALIGN_LEFT,	"Recv-Q",		" ",	0, 0, 0 },
-        { ALIGN_LEFT,	"Send-Q",		" ",	0, 0, 0 },
-        { ALIGN_RIGHT,	"Local Address:",	" ",	0, 0, 0 },
-        { ALIGN_LEFT,	"Port",			"",	0, 0, 0 },
-        { ALIGN_RIGHT,	"Peer Address:",	" ",	0, 0, 0 },
-        { ALIGN_LEFT,	"Port",			"",	0, 0, 0 },
-        { ALIGN_LEFT,	"Process",		"",	0, 0, 0 },
-        { ALIGN_LEFT,	"",			"",	0, 0, 0 },
+        {"Time",            0},
+        {"Netid",           0},
+        {"State",           0},
+        {"Recv-Q",          0},
+        {"Send-Q",          0},
+        {"Local Address",  0},
+        {"Port",            0},
+        {"Peer Address",   0},
+        {"Port",            0},
+        {"Process",         0},
+        {"",            0},
 };
 
 static struct column *current_field = columns;
@@ -301,8 +292,6 @@ static FILE *generic_proc_open(const char *env, const char *name)
     return fopen(p, "r");
 }
 #define net_tcp_open()		generic_proc_open("PROC_NET_TCP", "net/tcp")
-#define ephemeral_ports_open()	generic_proc_open("PROC_IP_LOCAL_PORT_RANGE", \
-					"sys/net/ipv4/ip_local_port_range")
 
 static unsigned long long cookie_sk_get(const uint32_t *cookie)
 {
@@ -521,39 +510,6 @@ again:	/* Append to buffer: if we have a new chunk, print again */
         goto again;
 }
 
-static int print_left_spacing(struct column *f, int stored, int printed)
-{
-    int s;
-
-    if (!f->width || f->align == ALIGN_LEFT)
-        return 0;
-
-    s = f->width - stored - printed;
-    if (f->align == ALIGN_CENTER)
-        /* If count of total spacing is odd, shift right by one */
-        s = (s + 1) / 2;
-
-    if (s > 0)
-        return printf("%*c", s, ' ');
-
-    return 0;
-}
-
-static void print_right_spacing(struct column *f, int printed)
-{
-    int s;
-
-    if (!f->width || f->align == ALIGN_RIGHT)
-        return;
-
-    s = f->width - printed;
-    if (f->align == ALIGN_CENTER)
-        s /= 2;
-
-    if (s > 0)
-        printf("%*c", s, ' ');
-}
-
 /* Done with field: update buffer pointer, start new token after current one */
 static void field_flush(struct column *f)
 {
@@ -565,9 +521,6 @@ static void field_flush(struct column *f)
 
     chunk = buffer.tail;
     pad = buffer.cur->len % 2;
-
-    if (buffer.cur->len > f->max_len)
-        f->max_len = buffer.cur->len;
 
     /* We need a new chunk if we can't store the next length descriptor.
 	 * Mind the gap between end of previous token and next aligned position
@@ -618,125 +571,6 @@ static void buf_free_all(void)
     buffer.chunks = 0;
 }
 
-/* Get current screen width, returns -1 if TIOCGWINSZ fails */
-static int render_screen_width(void)
-{
-    int width = -1;
-
-    if (isatty(STDOUT_FILENO)) {
-        struct winsize w;
-
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1) {
-            if (w.ws_col > 0)
-                width = w.ws_col;
-        }
-    }
-
-    return width;
-}
-
-/* Calculate column width from contents length. If columns don't fit on one
- * line, break them into the least possible amount of lines and keep them
- * aligned across lines. Available screen space is equally spread between fields
- * as additional spacing.
- */
-static void render_calc_width(void)
-{
-    int screen_width, first, len = 0, linecols = 0;
-    struct column *c, *eol = columns - 1;
-    bool compact_output = false;
-
-    screen_width = render_screen_width();
-    if (screen_width == -1) {
-        screen_width = INT_MAX;
-        compact_output = true;
-    }
-
-    /* First pass: set width for each column to measured content length */
-    for (first = 1, c = columns; c - columns < COL_MAX; c++) {
-        if (c->disabled)
-            continue;
-
-        if (!first && c->max_len)
-            c->width = c->max_len + strlen(c->ldelim);
-        else
-            c->width = c->max_len;
-
-        /* But don't exceed screen size. If we exceed the screen size
-		 * for even a single field, it will just start on a line of its
-		 * own and then naturally wrap.
-		 */
-        c->width = min(c->width, screen_width);
-
-        if (c->width)
-            first = 0;
-    }
-
-    if (compact_output) {
-        /* Compact output, skip extending columns. */
-        return;
-    }
-
-    /* Second pass: find out newlines and distribute available spacing */
-    for (c = columns; c - columns < COL_MAX; c++) {
-        int pad, spacing, rem, last;
-        struct column *tmp;
-
-        if (!c->width)
-            continue;
-
-        linecols++;
-        len += c->width;
-
-        for (last = 1, tmp = c + 1; tmp - columns < COL_MAX; tmp++) {
-            if (tmp->width) {
-                last = 0;
-                break;
-            }
-        }
-
-        if (!last && len < screen_width) {
-            /* Columns fit on screen so far, nothing to do yet */
-            continue;
-        }
-
-        if (len == screen_width) {
-            /* Exact fit, just start with new line */
-            goto newline;
-        }
-
-        if (len > screen_width) {
-            /* Screen width exceeded: go back one column */
-            len -= c->width;
-            c--;
-            linecols--;
-        }
-
-        /* Distribute remaining space to columns on this line */
-        pad = screen_width - len;
-        spacing = pad / linecols;
-        rem = pad % linecols;
-        for (tmp = c; tmp > eol; tmp--) {
-            if (!tmp->width)
-                continue;
-
-            tmp->width += spacing;
-            if (rem) {
-                tmp->width++;
-                rem--;
-            }
-        }
-
-newline:
-        /* Line break: reset line counters, mark end-of-line */
-        eol = c;
-        len = 0;
-        linecols = 0;
-    }
-}
-
-//TODO simplify render
-/* Render buffered output with spacing and delimiters, then free up buffers */
 static void render(void)
 {
     struct buf_token *token;
@@ -751,26 +585,22 @@ static void render(void)
     /* Ensure end alignment of last token, it wasn't necessarily flushed */
     buffer.tail->end += buffer.cur->len % 2;
 
-    render_calc_width();
-
     /* Rewind and replay */
     buffer.tail = buffer.head;
 
     f = columns;
-    while (!f->width)
+    while (f->disabled)
         f++;
 
     while (token) {
         /* Print left delimiter only if we already started a line */
-        if (line_started++)
-            printed = printf("%s", f->ldelim);
+        if (line_started++ && !field_is_last(f))
+            printed = printf(";");
         else
             printed = 0;
 
         /* Print field content from token data with spacing */
-        printed += print_left_spacing(f, token->len, printed);
-        printed += fwrite(token->data, 1, token->len, stdout);
-        print_right_spacing(f, printed);
+        printed += fwrite(token->data, 1, token->len, out_file);
 
         /* Go to next non-empty field, deal with end-of-line */
         do {
@@ -872,28 +702,24 @@ static void sock_state_print(struct sockstat *s)
         fprintf(stderr, "sock_state_print: SCTP currently not supported\n");
     } else {
         field_set(COL_NETID);
-        out("%s", sock_name);
+        out("Netid:%s", sock_name);
         field_set(COL_STATE);
-        out("%s", sstate_name[s->state]);
+        out("State:%s", sstate_name[s->state]);
     }
 
     field_set(COL_RECVQ);
-    out("%-6d", s->rq);
+    out("RecvQ:%d", s->rq);
     field_set(COL_SENDQ);
-    out("%-6d", s->wq);
+    out("SendQ:%d", s->wq);
     field_set(COL_ADDR);
 }
 
-static void sock_addr_print(const char *addr, char *delim, const char *port,
-                            const char *ifname)
+static void sock_addr_print(const char *addr, char *delim, const char *port)
 {
-    if (ifname)
-        out("%s" "%%" "%s%s", addr, ifname, delim);
-    else
-        out("%s%s", addr, delim);
+    out("Ip:%s%s", addr, delim);
 
     field_next();
-    out("%s", port);
+    out("Port:%s", port);
     field_next();
 }
 
@@ -942,7 +768,6 @@ static void inet_addr_print(const inet_prefix *a, int port,
 {
     char buf[1024];
     const char *ap = buf;
-    const char *ifname = NULL;
 
     if (a->family == AF_INET) {
         ap = format_host(AF_INET, 4, a->data);
@@ -963,11 +788,7 @@ static void inet_addr_print(const inet_prefix *a, int port,
         }
     }
 
-    //TODO deal with the ll_map stuff
-    //if (ifindex)
-    //    ifname = ll_index_to_name(ifindex);
-
-    sock_addr_print(ap, ":", resolve_service(port), ifname);
+    sock_addr_print(ap, "", resolve_service(port));
 }
 
 static void inet_stats_print(struct sockstat *s, bool v6only)
@@ -1057,71 +878,125 @@ static void tcp_stats_print(struct tcpstat *s)
     char b1[64];
 
     if (s->has_ts_opt)
-        out(" ts");
+        out(";ts_opt:ts");
+    else
+        out(";ts_opt:-");
     if (s->has_sack_opt)
-        out(" sack");
+        out(";sack_opt:sack");
+    else
+        out(";sack_opt:-");
     if (s->has_ecn_opt)
-        out(" ecn");
+        out(";ecn_opt:ecn");
+    else
+        out(";ecn_opt:-");
     if (s->has_ecnseen_opt)
-        out(" ecnseen");
+        out(";ecnseen_opt:ecnseen");
+    else
+        out(";ecnseen_opt:-");
     if (s->has_fastopen_opt)
-        out(" fastopen");
+        out(";fastopen_opt:fastopen");
+    else
+        out(";fastopen_opt:-");
     if (s->cong_alg[0])
-        out(" %s", s->cong_alg);
+        out(";cong_alg:%s", s->cong_alg);
+    else
+        out(";cong_alg:-");
     if (s->has_wscale_opt)
-        out(" wscale:%d,%d", s->snd_wscale, s->rcv_wscale);
+        out(";wscale:%d,%d", s->snd_wscale, s->rcv_wscale);
+    else
+        out(";wscale:-");
     if (s->rto)
-        out(" rto:%g", s->rto);
+        out(";rto:%g", s->rto);
+    else
+        out(";rto:-");
     if (s->backoff)
-        out(" backoff:%u", s->backoff);
+        out(";backoff:%u", s->backoff);
+    else
+        out(";backoff:-");
     if (s->rtt)
-        out(" rtt:%g/%g", s->rtt, s->rttvar);
+        out(";rtt:%g/%g", s->rtt, s->rttvar);
+    else
+        out(";rtt:-");
     if (s->ato)
-        out(" ato:%g", s->ato);
+        out(";ato:%g", s->ato);
+    else
+        out(";ato:-");
 
     if (s->qack)
-        out(" qack:%d", s->qack);
+        out(";qack:%d", s->qack);
+    else
+        out(";qack:-");
     if (s->qack & 1)
         out(" bidir");
 
     if (s->mss)
-        out(" mss:%d", s->mss);
+        out(";mss:%d", s->mss);
+    else
+        out(";mss:-");
     if (s->pmtu)
-        out(" pmtu:%u", s->pmtu);
+        out(";pmtu:%u", s->pmtu);
+    else
+        out(";pmtu:-");
     if (s->rcv_mss)
-        out(" rcvmss:%d", s->rcv_mss);
+        out(";rcvmss:%d", s->rcv_mss);
+    else
+        out(";rcvmss:-");
     if (s->advmss)
-        out(" advmss:%d", s->advmss);
+        out(";advmss:%d", s->advmss);
+    else
+        out(";advmss:-");
     if (s->cwnd)
-        out(" cwnd:%u", s->cwnd);
+        out(";cwnd:%u", s->cwnd);
+    else
+        out(";cwnd:-");
     if (s->ssthresh)
-        out(" ssthresh:%d", s->ssthresh);
+        out(";ssthresh:%d", s->ssthresh);
+    else
+        out(";ssthresh:-");
 
     if (s->bytes_sent)
-        out(" bytes_sent:%llu", s->bytes_sent);
+        out(";bytes_sent:%llu", s->bytes_sent);
+    else
+        out(";bytes_sent:-");
     if (s->bytes_retrans)
-        out(" bytes_retrans:%llu", s->bytes_retrans);
+        out(";bytes_retrans:%llu", s->bytes_retrans);
+    else
+        out(";bytes_retrans:-");
     if (s->bytes_acked)
-        out(" bytes_acked:%llu", s->bytes_acked);
+        out(";bytes_acked:%llu", s->bytes_acked);
+    else
+        out(";bytes_acked:-");
     if (s->bytes_received)
-        out(" bytes_received:%llu", s->bytes_received);
+        out(";bytes_received:%llu", s->bytes_received);
+    else
+        out(";bytes_received:-");
     if (s->segs_out)
-        out(" segs_out:%u", s->segs_out);
+        out(";segs_out:%u", s->segs_out);
+    else
+        out(";segs_out:-");
     if (s->segs_in)
-        out(" segs_in:%u", s->segs_in);
+        out(";segs_in:%u", s->segs_in);
+    else
+        out(";segs_in:-");
     if (s->data_segs_out)
-        out(" data_segs_out:%u", s->data_segs_out);
+        out(";data_segs_out:%u", s->data_segs_out);
+    else
+        out(";data_segs_out:-");
     if (s->data_segs_in)
-        out(" data_segs_in:%u", s->data_segs_in);
+        out(";data_segs_in:%u", s->data_segs_in);
+    else
+        out(";data_segs_in:-");
 
     if (s->dctcp && s->dctcp->enabled) {
         struct dctcpstat *dctcp = s->dctcp;
 
-        out(" dctcp:(ce_state:%u,alpha:%u,ab_ecn:%u,ab_tot:%u)",
+        out(";dctcp:(ce_state:%u,alpha:%u,ab_ecn:%u,ab_tot:%u)",
             dctcp->ce_state, dctcp->alpha, dctcp->ab_ecn,
             dctcp->ab_tot);
     } else if (s->dctcp) {
-        out(" dctcp:fallback_mode");
+        out(";dctcp:fallback_mode");
+    } else {
+        out(";dctcp:-");
     }
 
     if (s->bbr_info) {
@@ -1131,7 +1006,7 @@ static void tcp_stats_print(struct tcpstat *s)
         bw <<= 32;
         bw |= s->bbr_info->bbr_bw_lo;
 
-        out(" bbr:(bw:%sbps,mrtt:%g",
+        out(";bbr:(bw:%sbps,mrtt:%g",
             sprint_bw(b1, bw * 8.0),
             (double)s->bbr_info->bbr_min_rtt / 1000.0);
         if (s->bbr_info->bbr_pacing_gain)
@@ -1141,74 +1016,132 @@ static void tcp_stats_print(struct tcpstat *s)
             out(",cwnd_gain:%g",
                 (double)s->bbr_info->bbr_cwnd_gain / 256.0);
         out(")");
+    } else {
+        out(";bbr:-");
     }
 
     if (s->send_bps)
-        out(" send %sbps", sprint_bw(b1, s->send_bps));
+        out(";send:%sbps", sprint_bw(b1, s->send_bps));
+    else
+        out(";send:-");
     if (s->lastsnd)
-        out(" lastsnd:%u", s->lastsnd);
+        out(";lastsnd:%u", s->lastsnd);
+    else
+        out(";lastsnd:-");
     if (s->lastrcv)
-        out(" lastrcv:%u", s->lastrcv);
+        out(";lastrcv:%u", s->lastrcv);
+    else
+        out(";lastrcv:-");
     if (s->lastack)
-        out(" lastack:%u", s->lastack);
+        out(";lastack:%u", s->lastack);
+    else
+        out(";lastack:-");
 
     if (s->pacing_rate) {
-        out(" pacing_rate %sbps", sprint_bw(b1, s->pacing_rate));
+        out(";pacing_rate:%sbps", sprint_bw(b1, s->pacing_rate));
         if (s->pacing_rate_max)
             out("/%sbps", sprint_bw(b1, s->pacing_rate_max));
+        else
+            out("/-");
+    } else {
+        out(";pacing_rate:-");
     }
 
     if (s->delivery_rate)
-        out(" delivery_rate %sbps", sprint_bw(b1, s->delivery_rate));
+        out(";delivery_rate:%sbps", sprint_bw(b1, s->delivery_rate));
+    else
+        out(";delivery_rate:-");
     if (s->delivered)
-        out(" delivered:%u", s->delivered);
+        out(";delivered:%u", s->delivered);
+    else
+        out(";delivered:-");
     if (s->delivered_ce)
-        out(" delivered_ce:%u", s->delivered_ce);
+        out(";delivered_ce:%u", s->delivered_ce);
+    else
+        out(";delivered_ce:-");
     if (s->app_limited)
-        out(" app_limited");
+        out(";app_limited:app_limited");
+    else
+        out(";app_limited:-");
 
     if (s->busy_time) {
-        out(" busy:%llums", s->busy_time / 1000);
+        out(";busy:%llums", s->busy_time / 1000);
         if (s->rwnd_limited)
-            out(" rwnd_limited:%llums(%.1f%%)",
+            out(";rwnd_limited:%llums(%.1f%%)",
                 s->rwnd_limited / 1000,
                 100.0 * s->rwnd_limited / s->busy_time);
+        else
+            out(";rwnd_limited:-");
         if (s->sndbuf_limited)
-            out(" sndbuf_limited:%llums(%.1f%%)",
+            out(";sndbuf_limited:%llums(%.1f%%)",
                 s->sndbuf_limited / 1000,
                 100.0 * s->sndbuf_limited / s->busy_time);
+        else
+            out(";sndbuf_limited:-");
+    } else {
+        out(";busy:-;rwnd_limited:-;sndbuf_limited:-");
     }
 
     if (s->unacked)
-        out(" unacked:%u", s->unacked);
+        out(";unacked:%u", s->unacked);
+    else
+        out(";unacked:-");
     if (s->retrans || s->retrans_total)
-        out(" retrans:%u/%u", s->retrans, s->retrans_total);
+        out(";retrans:%u/%u", s->retrans, s->retrans_total);
+    else
+        out(";retrans:-");
     if (s->lost)
-        out(" lost:%u", s->lost);
+        out(";lost:%u", s->lost);
+    else
+        out(";lost:-");
     if (s->sacked && s->ss.state != SS_LISTEN)
-        out(" sacked:%u", s->sacked);
+        out(";sacked:%u", s->sacked);
+    else
+        out(";sacked:-");
     if (s->dsack_dups)
-        out(" dsack_dups:%u", s->dsack_dups);
+        out(";dsack_dups:%u", s->dsack_dups);
+    else
+        out(";dsack_dups:-");
     if (s->fackets)
-        out(" fackets:%u", s->fackets);
+        out(";fackets:%u", s->fackets);
+    else
+        out(";fackets:-");
     if (s->reordering != 3)
-        out(" reordering:%d", s->reordering);
+        out(";reordering:%d", s->reordering);
+    else
+        out(";reordering:-");
     if (s->reord_seen)
-        out(" reord_seen:%d", s->reord_seen);
+        out(";reord_seen:%d", s->reord_seen);
+    else
+        out(";reord_seen:-");
     if (s->rcv_rtt)
-        out(" rcv_rtt:%g", s->rcv_rtt);
+        out(";rcv_rtt:%g", s->rcv_rtt);
+    else
+        out(";rcv_rtt:-");
     if (s->rcv_space)
-        out(" rcv_space:%d", s->rcv_space);
+        out(";rcv_space:%d", s->rcv_space);
+    else
+        out(";rcv_space:-");
     if (s->rcv_ssthresh)
-        out(" rcv_ssthresh:%u", s->rcv_ssthresh);
+        out(";rcv_ssthresh:%u", s->rcv_ssthresh);
+    else
+        out(";rcv_ssthresh:-");
     if (s->not_sent)
-        out(" notsent:%u", s->not_sent);
+        out(";notsent:%u", s->not_sent);
+    else
+        out(";notsent:-");
     if (s->min_rtt)
-        out(" minrtt:%g", s->min_rtt);
+        out(";minrtt:%g", s->min_rtt);
+    else
+        out(";minrtt:-");
     if (s->rcv_ooopack)
-        out(" rcv_ooopack:%u", s->rcv_ooopack);
+        out(";rcv_ooopack:%u", s->rcv_ooopack);
+    else
+        out(";rcv_ooopack:-");
     if (s->snd_wnd)
-        out(" snd_wnd:%u", s->snd_wnd);
+        out(";snd_wnd:%u", s->snd_wnd);
+    else
+        out(";snd_wnd:-");
 }
 
 static void tcp_timer_print(struct tcpstat *s)
@@ -1225,7 +1158,7 @@ static void tcp_timer_print(struct tcpstat *s)
     if (s->timer) {
         if (s->timer > 4)
             s->timer = 5;
-        out(" timer:(%s,%s,%d)",
+        out(";timer:(%s,%s,%d)",
             tmr_name[s->timer],
             print_ms_timer(s->timeout),
             s->retrans);
@@ -1327,7 +1260,7 @@ static void print_skmeminfo(struct rtattr *tb[], int attrtype)
             const struct inet_diag_meminfo *minfo =
                     RTA_DATA(tb[INET_DIAG_MEMINFO]);
 
-            out(" mem:(r%u,w%u,f%u,t%u)",
+            out(";mem:(r%u,w%u,f%u,t%u)",
                 minfo->idiag_rmem,
                 minfo->idiag_wmem,
                 minfo->idiag_fmem,
@@ -1338,7 +1271,7 @@ static void print_skmeminfo(struct rtattr *tb[], int attrtype)
 
     skmeminfo = RTA_DATA(tb[attrtype]);
 
-    out(" skmem:(r%u,rb%u,t%u,tb%u,f%u,w%u,o%u",
+    out(";skmem:(r%u,rb%u,t%u,tb%u,f%u,w%u,o%u",
         skmeminfo[SK_MEMINFO_RMEM_ALLOC],
         skmeminfo[SK_MEMINFO_RCVBUF],
         skmeminfo[SK_MEMINFO_WMEM_ALLOC],
@@ -1350,10 +1283,14 @@ static void print_skmeminfo(struct rtattr *tb[], int attrtype)
     if (RTA_PAYLOAD(tb[attrtype]) >=
         (SK_MEMINFO_BACKLOG + 1) * sizeof(__u32))
         out(",bl%u", skmeminfo[SK_MEMINFO_BACKLOG]);
+    else
+        out(",bl-");
 
     if (RTA_PAYLOAD(tb[attrtype]) >=
         (SK_MEMINFO_DROPS + 1) * sizeof(__u32))
         out(",d%u", skmeminfo[SK_MEMINFO_DROPS]);
+    else
+        out(",d-");
 
     out(")");
 }
@@ -1516,17 +1453,16 @@ static void tcp_show_info(const struct nlmsghdr *nlh, struct inet_diag_msg *r,
 //            print_md5sig(sig++);
 //        }
 //    }
-    if (tb[INET_DIAG_ULP_INFO]) {
-        struct rtattr *ulpinfo[INET_ULP_INFO_MAX + 1] = { 0 };
-
-        parse_rtattr_nested(ulpinfo, INET_ULP_INFO_MAX,
-                            tb[INET_DIAG_ULP_INFO]);
-
-        if (ulpinfo[INET_ULP_INFO_NAME])
-            out(" tcp-ulp-%s",
-                rta_getattr_str(ulpinfo[INET_ULP_INFO_NAME]));
-
-        //TODO Ignore this for now
+//    if (tb[INET_DIAG_ULP_INFO]) {
+//        struct rtattr *ulpinfo[INET_ULP_INFO_MAX + 1] = { 0 };
+//
+//        parse_rtattr_nested(ulpinfo, INET_ULP_INFO_MAX,
+//                            tb[INET_DIAG_ULP_INFO]);
+//
+//        if (ulpinfo[INET_ULP_INFO_NAME])
+//            out(" tcp-ulp-%s",
+//                rta_getattr_str(ulpinfo[INET_ULP_INFO_NAME]));
+//
 //        if (ulpinfo[INET_ULP_INFO_TLS]) {
 //            struct rtattr *tlsinfo[TLS_INFO_MAX + 1] = { 0 };
 //
@@ -1539,7 +1475,6 @@ static void tcp_show_info(const struct nlmsghdr *nlh, struct inet_diag_msg *r,
 //            tcp_tls_conf("txconf", tlsinfo[TLS_INFO_TXCONF]);
 //            tcp_tls_zc_sendfile(tlsinfo[TLS_INFO_ZC_RO_TX]);
 //        }
-        //TODO Ignore this for now
 //        if (ulpinfo[INET_ULP_INFO_MPTCP]) {
 //            struct rtattr *sfinfo[MPTCP_SUBFLOW_ATTR_MAX + 1] =
 //                    { 0 };
@@ -1548,7 +1483,7 @@ static void tcp_show_info(const struct nlmsghdr *nlh, struct inet_diag_msg *r,
 //                                ulpinfo[INET_ULP_INFO_MPTCP]);
 //            mptcp_subflow_info(sfinfo);
 //        }
-    }
+//    }
 }
 
 static void parse_diag_msg(struct nlmsghdr *nlh, struct sockstat *s)
@@ -1617,9 +1552,7 @@ static int inet_show_sock(struct nlmsghdr *nlh,
         tcp_timer_print(&t);
     }
 
-    if (show_mem || (show_tcpinfo && s->type != IPPROTO_UDP)) {
-        if (!oneline)
-            out("\n\t");
+    if (show_mem || show_tcpinfo) {
         tcp_show_info(nlh, r, tb);
     }
 
@@ -1979,8 +1912,7 @@ static void _usage(FILE *dest)
             "   -m, --memory        show socket memory usage\n"
             "   -i, --info          show internal TCP information\n"
             "\n"
-            "   -H, --no-header     Suppress header line\n"
-            "   -O, --oneline       socket's data printed on a single line\n"
+            "   -H, --header        Print header line\n"
             "\n"
             "       --time          the time to run this tool for (see also interval)\n"
             "       --interval      interval between printing current statistics\n"
@@ -2012,8 +1944,7 @@ static const struct option long_opts[] = {
         { "listening", 0, 0, 'l' },
         { "version", 0, 0, 'V' },
         { "help", 0, 0, 'h' },
-        { "no-header", 0, 0, 'H' },
-        { "oneline", 0, 0, 'O' },
+        { "header", 0, 0, 'H' },
         { "time", 1, 0, OPT_TIME },
         { "interval", 1, 0, OPT_INTERVAL },
         { 0 }
@@ -2049,7 +1980,7 @@ int main(int argc, char *argv[])
     long interval = 100;
 
     while ((ch = getopt_long(argc, argv,
-                             "halomivVHO",
+                             "halomivVH",
                              long_opts, NULL)) != EOF) {
         switch (ch) {
             case 'o':
@@ -2072,10 +2003,7 @@ int main(int argc, char *argv[])
                 printf("simple socket statistics %s\n", version);
                 exit(0);
             case 'H':
-                show_header = 0;
-                break;
-            case 'O':
-                oneline = 1;
+                show_header = 1;
                 break;
             case OPT_TIME:
                 time = parse_number(optarg);
@@ -2122,6 +2050,8 @@ int main(int argc, char *argv[])
     if (!(current_filter.states & (current_filter.states - 1)))
         columns[COL_STATE].disabled = 1;
 
+    columns[COL_TIME].disabled = 1;
+
     if (show_header)
         print_header();
 
@@ -2132,6 +2062,8 @@ int main(int argc, char *argv[])
     struct timespec tspec;
     tspec.tv_sec = interval / 1000;
     tspec.tv_nsec = (interval % 1000) * 1000000;
+
+    out_file = stdout;
 
     for (long i = 0; i < repetitions - 1; ++i) {
         tcp_show(&current_filter);
