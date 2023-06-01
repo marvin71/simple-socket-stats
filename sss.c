@@ -115,6 +115,7 @@ static int show_mem;
 static int show_tcpinfo;
 static int show_header = 0;
 static FILE *out_file;
+static long current_time = 0;
 
 enum col_id {
     COL_TIME,
@@ -791,8 +792,15 @@ static void inet_addr_print(const inet_prefix *a, int port,
     sock_addr_print(ap, "", resolve_service(port));
 }
 
+static void time_print(void)
+{
+    field_set(COL_TIME);
+    out("Time:%ld", current_time);
+}
+
 static void inet_stats_print(struct sockstat *s, bool v6only)
 {
+    time_print();
     sock_state_print(s);
 
     inet_addr_print(&s->local, s->lport, s->iface, v6only);
@@ -2050,8 +2058,6 @@ int main(int argc, char *argv[])
     if (!(current_filter.states & (current_filter.states - 1)))
         columns[COL_STATE].disabled = 1;
 
-    columns[COL_TIME].disabled = 1;
-
     if (show_header)
         print_header();
 
@@ -2065,12 +2071,14 @@ int main(int argc, char *argv[])
 
     out_file = stdout;
 
+    current_time = 0;
     for (long i = 0; i < repetitions - 1; ++i) {
         tcp_show(&current_filter);
         render();
         if (show_header)
             print_header();
         nanosleep(&tspec, NULL);
+        current_time += interval;
     }
     tcp_show(&current_filter);
     render();
