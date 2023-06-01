@@ -114,7 +114,7 @@ static int show_options;
 static int show_mem;
 static int show_tcpinfo;
 static int show_header = 0;
-static FILE *out_file;
+static FILE *out_file = NULL;
 static long current_time = 0;
 
 enum col_id {
@@ -575,7 +575,7 @@ static void buf_free_all(void)
 static void render(void)
 {
     struct buf_token *token;
-    int printed, line_started = 0;
+    int line_started = 0;
     struct column *f;
 
     if (!buffer.head)
@@ -596,17 +596,15 @@ static void render(void)
     while (token) {
         /* Print left delimiter only if we already started a line */
         if (line_started++ && !field_is_last(f))
-            printed = printf(";");
-        else
-            printed = 0;
+            fprintf(out_file, ";");
 
         /* Print field content from token data with spacing */
-        printed += fwrite(token->data, 1, token->len, out_file);
+        fwrite(token->data, 1, token->len, out_file);
 
         /* Go to next non-empty field, deal with end-of-line */
         do {
             if (field_is_last(f)) {
-                printf("\n");
+                fprintf(out_file, "\n");
                 f = columns;
                 line_started = 0;
             } else {
@@ -620,7 +618,7 @@ static void render(void)
 	 * is not the last field.
 	 */
     if (line_started)
-        printf("\n");
+        fprintf(out_file, "\n");
 
     buf_free_all();
     current_field = columns;
@@ -1953,6 +1951,7 @@ static const struct option long_opts[] = {
         { "version", 0, 0, 'V' },
         { "help", 0, 0, 'h' },
         { "header", 0, 0, 'H' },
+        {"out", 1, 0, 'O'},
         { "time", 1, 0, OPT_TIME },
         { "interval", 1, 0, OPT_INTERVAL },
         { 0 }
@@ -1986,9 +1985,10 @@ int main(int argc, char *argv[])
     int state_filter = 0;
     long time = 100;
     long interval = 100;
+    char *file_path = NULL;
 
     while ((ch = getopt_long(argc, argv,
-                             "halomivVH",
+                             "halomivVHO:",
                              long_opts, NULL)) != EOF) {
         switch (ch) {
             case 'o':
@@ -2012,6 +2012,9 @@ int main(int argc, char *argv[])
                 exit(0);
             case 'H':
                 show_header = 1;
+                break;
+            case 'O':
+                file_path = optarg;
                 break;
             case OPT_TIME:
                 time = parse_number(optarg);
@@ -2069,7 +2072,15 @@ int main(int argc, char *argv[])
     tspec.tv_sec = interval / 1000;
     tspec.tv_nsec = (interval % 1000) * 1000000;
 
-    out_file = stdout;
+    if (file_path == NULL) {
+        out_file = stdout;
+    } else {
+        out_file = fopen(file_path, "w");
+        if (out_file == NULL) {
+            fprintf(stderr, "Could not open file. Fallback to stdout.\n");
+            out_file = stdout;
+        }
+    }
 
     current_time = 0;
     for (long i = 0; i < repetitions - 1; ++i) {
@@ -2082,6 +2093,10 @@ int main(int argc, char *argv[])
     }
     tcp_show(&current_filter);
     render();
+
+    if (out_file != stdout) {
+        fclose(out_file);
+    }
 
     return 0;
 }
