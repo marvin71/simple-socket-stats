@@ -400,8 +400,6 @@ static const char *proto_name(int protocol)
             return "udp";
         case IPPROTO_TCP:
             return "tcp";
-        case IPPROTO_MPTCP:
-            return "mptcp";
         case IPPROTO_SCTP:
             return "sctp";
         case IPPROTO_DCCP:
