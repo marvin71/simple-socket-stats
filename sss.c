@@ -1920,6 +1920,7 @@ static void _usage(FILE *dest)
             "\n"
             "       --time          the time to run this tool for (see also interval)\n"
             "       --interval      interval between printing current statistics\n"
+            "   -O, --out           write output to this file instead of stdout\n"
     );
 }
 
@@ -1949,7 +1950,7 @@ static const struct option long_opts[] = {
         { "version", 0, 0, 'V' },
         { "help", 0, 0, 'h' },
         { "header", 0, 0, 'H' },
-        {"out", 1, 0, 'O'},
+        { "out", 1, 0, 'O' },
         { "time", 1, 0, OPT_TIME },
         { "interval", 1, 0, OPT_INTERVAL },
         { 0 }
