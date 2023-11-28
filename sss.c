@@ -114,6 +114,7 @@ static int show_options;
 static int show_mem;
 static int show_tcpinfo;
 static int show_header = 0;
+static int render_step = 0;
 static FILE *out_file = NULL;
 static long current_time = 0;
 
@@ -627,7 +628,10 @@ static void render(void)
  */
 static void field_next(void)
 {
-    if (field_is_last(current_field) && buffer.chunks >= BUF_CHUNKS_MAX) {
+    // If we only render once at the end, we disable premature rendering
+    // and let the buffer grow 'infinitely'
+    if (render_step && field_is_last(current_field)
+        && buffer.chunks >= BUF_CHUNKS_MAX) {
         render();
         return;
     }
@@ -1921,6 +1925,7 @@ static void _usage(FILE *dest)
             "       --time          the time to run this tool for (see also interval)\n"
             "       --interval      interval between printing current statistics\n"
             "   -O, --out           write output to this file instead of stdout\n"
+            "   -r, --render_step   render each step, otherwise render output only once at the end\n"
     );
 }
 
@@ -1953,6 +1958,7 @@ static const struct option long_opts[] = {
         { "out", 1, 0, 'O' },
         { "time", 1, 0, OPT_TIME },
         { "interval", 1, 0, OPT_INTERVAL },
+        { "render_step", 0, 0, 'r' },
         { 0 }
 
 };
@@ -1987,7 +1993,7 @@ int main(int argc, char *argv[])
     char *file_path = NULL;
 
     while ((ch = getopt_long(argc, argv,
-                             "halomivVHO:",
+                             "halomivVHO:r",
                              long_opts, NULL)) != EOF) {
         switch (ch) {
             case 'o':
@@ -2020,6 +2026,9 @@ int main(int argc, char *argv[])
                 break;
             case OPT_INTERVAL:
                 interval = parse_number(optarg);
+                break;
+            case 'r':
+                render_step = 1;
                 break;
             case 'h':
                 help();
@@ -2084,7 +2093,10 @@ int main(int argc, char *argv[])
     current_time = 0;
     for (long i = 0; i < repetitions - 1; ++i) {
         tcp_show(&current_filter);
-        render();
+        if (render_step)
+            render();
+        else
+            field_set(COL_TIME);
         if (show_header)
             print_header();
         nanosleep(&tspec, NULL);
